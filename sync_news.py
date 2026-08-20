@@ -7,12 +7,14 @@ import urllib.error
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import timezone
+from urllib.parse import urljoin
 
 
 RSS_URL = os.environ["RSS_FEED_URL"]
 WEBFLOW_TOKEN = os.environ["WEBFLOW_API_TOKEN"]
 COLLECTION_ID = os.environ["WEBFLOW_COLLECTION_ID"]
 SITE_ID = os.environ["WEBFLOW_SITE_ID"]
+
 
 WEBFLOW_ITEMS_URL = (
     f"https://api.webflow.com/v2/collections/"
@@ -52,7 +54,167 @@ def clean_text(value):
     return " ".join(value.split()).strip()
 
 
+def find_text(item, tag_name):
+    """
+    Finds a normal RSS element or namespaced element.
+    """
+
+    value = item.findtext(tag_name)
+
+    if value:
+        return value
+
+    for child in item:
+        if child.tag.endswith(tag_name):
+            return child.text or ""
+
+    return ""
+
+
+def find_image_from_rss(item):
+    """
+    Try common RSS image formats:
+    1. media:content
+    2. media:thumbnail
+    3. enclosure
+    4. image/media elements
+    5. image URL inside description/content HTML
+    """
+
+    # --------------------------------------------------
+    # 1. media:content
+    # --------------------------------------------------
+
+    for child in item:
+
+        if child.tag.endswith("content"):
+
+            image_url = child.attrib.get("url", "")
+
+            media_type = child.attrib.get(
+                "type",
+                ""
+            ).lower()
+
+            if image_url and (
+                media_type.startswith("image/")
+                or not media_type
+            ):
+                return image_url
+
+
+    # --------------------------------------------------
+    # 2. media:thumbnail
+    # --------------------------------------------------
+
+    for child in item:
+
+        if child.tag.endswith("thumbnail"):
+
+            image_url = child.attrib.get(
+                "url",
+                ""
+            )
+
+            if image_url:
+                return image_url
+
+
+    # --------------------------------------------------
+    # 3. enclosure
+    # --------------------------------------------------
+
+    for child in item:
+
+        if child.tag.endswith("enclosure"):
+
+            image_url = child.attrib.get(
+                "url",
+                ""
+            )
+
+            media_type = child.attrib.get(
+                "type",
+                ""
+            ).lower()
+
+            if image_url and (
+                media_type.startswith("image/")
+                or image_url.lower().endswith(
+                    (
+                        ".jpg",
+                        ".jpeg",
+                        ".png",
+                        ".webp",
+                        ".gif"
+                    )
+                )
+            ):
+                return image_url
+
+
+    # --------------------------------------------------
+    # 4. Other image elements
+    # --------------------------------------------------
+
+    for child in item:
+
+        if "image" in child.tag.lower():
+
+            image_url = child.attrib.get(
+                "url",
+                ""
+            )
+
+            if image_url:
+                return image_url
+
+            if child.text:
+                value = child.text.strip()
+
+                if value.startswith("http"):
+                    return value
+
+
+    # --------------------------------------------------
+    # 5. Search description/content HTML
+    # --------------------------------------------------
+
+    html_content = ""
+
+    for child in item:
+
+        tag = child.tag.lower()
+
+        if (
+            tag.endswith("description")
+            or tag.endswith("encoded")
+            or tag.endswith("content")
+        ):
+            if child.text:
+                html_content += " " + child.text
+
+
+    if html_content:
+
+        image_match = re.search(
+            r'<img[^>]+src=["\']([^"\']+)["\']',
+            html_content,
+            re.IGNORECASE
+        )
+
+        if image_match:
+
+            return html.unescape(
+                image_match.group(1)
+            )
+
+
+    return ""
+
+
 def parse_rss(data):
+
     root = ET.fromstring(data)
 
     articles = []
@@ -60,15 +222,19 @@ def parse_rss(data):
     for item in root.findall(".//item"):
 
         title = clean_text(
-            item.findtext("title")
+            find_text(item, "title")
         )
 
         link = clean_text(
-            item.findtext("link")
+            find_text(item, "link")
         )
 
         pub_date = clean_text(
-            item.findtext("pubDate")
+            find_text(item, "pubDate")
+        )
+
+        image = find_image_from_rss(
+            item
         )
 
         if not title or not link:
@@ -79,6 +245,7 @@ def parse_rss(data):
                 "title": title,
                 "link": link,
                 "pub_date": pub_date,
+                "image": image,
             }
         )
 
@@ -215,6 +382,7 @@ def create_cms_item(article):
     title = article["title"]
     link = article["link"]
     pub_date = article["pub_date"]
+    image = article.get("image", "")
 
     source = get_source(link)
 
@@ -224,6 +392,10 @@ def create_cms_item(article):
         pub_date
     )
 
+    # ------------------------------------------
+    # Existing Webflow fields
+    # ------------------------------------------
+
     field_data = {
         "name": title,
         "slug": slug,
@@ -231,6 +403,17 @@ def create_cms_item(article):
         "source": source,
         "publish-date": webflow_date,
     }
+
+    # ------------------------------------------
+    # Add image only when RSS has an image
+    # ------------------------------------------
+
+    if image:
+
+        field_data["news-image"] = {
+            "url": image,
+            "alt": title
+        }
 
     payload = {
         "isArchived": False,
@@ -248,11 +431,22 @@ def create_cms_item(article):
         f"Created Webflow item: {status}"
     )
 
+    if image:
+        print(
+            f"Image added: {image}"
+        )
+    else:
+        print(
+            "No image found for this article."
+        )
+
 
 def publish_site():
 
     print("")
-    print("Publishing Webflow site...")
+    print(
+        "Publishing Webflow site..."
+    )
 
     payload = {
         "publishToWebflowSubdomain": True
@@ -344,6 +538,11 @@ def main():
         print(
             f"RSS Date: "
             f"{article['pub_date']}"
+        )
+
+        print(
+            f"Image: "
+            f"{article.get('image') or 'None'}"
         )
 
         print(
