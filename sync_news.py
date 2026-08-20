@@ -5,6 +5,7 @@ import json
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
+
 from email.utils import parsedate_to_datetime
 from datetime import timezone
 
@@ -22,63 +23,26 @@ SITE_ID = os.environ["WEBFLOW_SITE_ID"]
 # COLLECTION IDS
 # ============================================================
 
-# Ticker collection
 TICKER_COLLECTION_ID = "69b2a1bd8d44d2270008a256"
 
-# Trending News collection
-TRENDING_COLLECTION_ID = "69b29bb5bd5023577d30cdf1"
+TRENDING_NEWS_COLLECTION_ID = "69b29bb5bd5023577d30cdf1"
 
 
 # ============================================================
-# WEBFLOW API REQUEST
+# WEBFLOW API URLS
 # ============================================================
 
-def webflow_request(method, url, data=None):
-
-    headers = {
-        "Authorization": f"Bearer {WEBFLOW_TOKEN}",
-        "Content-Type": "application/json",
-        "Accept-Version": "1.0.0",
-    }
-
-    request = urllib.request.Request(
-        url,
-        method=method,
-        headers=headers
+def collection_items_url(collection_id):
+    return (
+        f"https://api.webflow.com/v2/collections/"
+        f"{collection_id}/items"
     )
 
-    if data is not None:
-        request.data = json.dumps(
-            data
-        ).encode("utf-8")
 
-    try:
-
-        with urllib.request.urlopen(
-            request,
-            timeout=30
-        ) as response:
-
-            return (
-                response.status,
-                response.read().decode("utf-8")
-            )
-
-    except urllib.error.HTTPError as error:
-
-        error_body = error.read().decode(
-            "utf-8",
-            errors="replace"
-        )
-
-        print("")
-        print(
-            f"Webflow API error: {error.code}"
-        )
-
-        print(error_body)
-
-        raise
+WEBFLOW_PUBLISH_URL = (
+    f"https://api.webflow.com/v2/sites/"
+    f"{SITE_ID}/publish"
+)
 
 
 # ============================================================
@@ -87,7 +51,6 @@ def webflow_request(method, url, data=None):
 
 def fetch_rss():
 
-    print("")
     print("Reading RSS feed...")
 
     request = urllib.request.Request(
@@ -107,7 +70,7 @@ def fetch_rss():
 
 
 # ============================================================
-# CLEAN RSS TEXT
+# CLEAN TEXT
 # ============================================================
 
 def clean_text(value):
@@ -155,17 +118,19 @@ def parse_rss(data):
         if not title or not link:
             continue
 
-        articles.append({
-            "title": title,
-            "link": link,
-            "pub_date": pub_date
-        })
+        articles.append(
+            {
+                "title": title,
+                "link": link,
+                "pub_date": pub_date,
+            }
+        )
 
     return articles
 
 
 # ============================================================
-# CONVERT DATE
+# CONVERT RSS DATE TO WEBFLOW DATETIME
 # ============================================================
 
 def convert_date(date_string):
@@ -247,49 +212,128 @@ def create_slug(title):
 
 
 # ============================================================
-# GET ALL WEBFLOW ITEMS
+# WEBFLOW REQUEST
+# ============================================================
+
+def webflow_request(
+    method,
+    url,
+    data=None
+):
+
+    headers = {
+        "Authorization":
+            f"Bearer {WEBFLOW_TOKEN}",
+
+        "Content-Type":
+            "application/json",
+
+        "Accept":
+            "application/json",
+    }
+
+    request = urllib.request.Request(
+        url,
+        method=method,
+        headers=headers
+    )
+
+    if data is not None:
+
+        request.data = json.dumps(
+            data
+        ).encode("utf-8")
+
+    try:
+
+        with urllib.request.urlopen(
+            request,
+            timeout=30
+        ) as response:
+
+            return (
+                response.status,
+                response.read().decode(
+                    "utf-8"
+                )
+            )
+
+    except urllib.error.HTTPError as error:
+
+        error_body = error.read().decode(
+            "utf-8",
+            errors="replace"
+        )
+
+        print(
+            f"Webflow API error: {error.code}"
+        )
+
+        print(error_body)
+
+        raise
+
+
+# ============================================================
+# GET ALL EXISTING WEBFLOW ITEMS
 # ============================================================
 
 def get_existing_items(collection_id):
 
-    url = (
-        f"https://api.webflow.com/v2/collections/"
-        f"{collection_id}/items"
+    print(
+        "Reading existing Webflow items..."
     )
 
-    try:
+    all_items = []
+
+    offset = 0
+
+    limit = 100
+
+    while True:
+
+        url = (
+            collection_items_url(
+                collection_id
+            )
+            + f"?offset={offset}&limit={limit}"
+        )
 
         status, response = webflow_request(
             "GET",
             url
         )
 
-        data = json.loads(
-            response
-        )
+        data = json.loads(response)
 
-        return data.get(
+        items = data.get(
             "items",
             []
         )
 
-    except Exception as error:
-
-        print(
-            f"Could not read collection items: {error}"
+        all_items.extend(
+            items
         )
 
-        return []
+        if len(items) < limit:
+            break
+
+        offset += limit
+
+    print(
+        f"Found {len(all_items)} existing items."
+    )
+
+    return all_items
 
 
 # ============================================================
-# FIND ITEM BY LINK
+# FIND EXISTING ARTICLE
 # ============================================================
 
-def find_existing_item(
+def find_existing_article(
     existing_items,
-    link_field,
-    article_link
+    link
 ):
 
     for item in existing_items:
@@ -299,11 +343,13 @@ def find_existing_item(
             {}
         )
 
-        existing_link = field_data.get(
-            link_field
+        existing_link = (
+            field_data.get("news-link")
+            or field_data.get("news-url")
+            or ""
         )
 
-        if existing_link == article_link:
+        if existing_link == link:
 
             return item
 
@@ -311,15 +357,13 @@ def find_existing_item(
 
 
 # ============================================================
-# SYNC ONE ARTICLE
+# CREATE NEW ITEM
 # ============================================================
 
-def sync_article(
+def create_item(
     collection_id,
     article,
-    link_field,
-    source_field,
-    existing_items
+    include_slug=True
 ):
 
     title = article["title"]
@@ -328,13 +372,92 @@ def sync_article(
 
     pub_date = article["pub_date"]
 
-    source = get_source(
-        link
+    source = get_source(link)
+
+    webflow_date = convert_date(
+        pub_date
     )
 
     slug = create_slug(
         title
     )
+
+
+    # --------------------------------------------------------
+    # BASIC FIELDS
+    # --------------------------------------------------------
+
+    field_data = {
+        "name": title,
+        "news-link": link,
+        "source-name": source,
+        "publish-date": webflow_date,
+    }
+
+
+    # --------------------------------------------------------
+    # SLUG
+    # --------------------------------------------------------
+
+    if include_slug:
+
+        field_data["slug"] = slug
+
+
+    # --------------------------------------------------------
+    # IMAGE
+    #
+    # IMAGE IS INTENTIONALLY DISABLED FOR NOW.
+    #
+    # Later, when we are ready, we can add:
+    #
+    # "news-image": {
+    #     "url": image_url,
+    #     "alt": title
+    # }
+    #
+    # --------------------------------------------------------
+
+
+    payload = {
+        "isArchived": False,
+        "isDraft": False,
+        "fieldData": field_data,
+    }
+
+
+    status, response = webflow_request(
+        "POST",
+        collection_items_url(
+            collection_id
+        ),
+        payload
+    )
+
+    print(
+        f"Created Webflow item: {status}"
+    )
+
+    return response
+
+
+# ============================================================
+# UPDATE EXISTING ITEM
+# ============================================================
+
+def update_item(
+    collection_id,
+    item_id,
+    article
+):
+
+    title = article["title"]
+
+    link = article["link"]
+
+    pub_date = article["pub_date"]
+
+    source = get_source(link)
 
     webflow_date = convert_date(
         pub_date
@@ -344,16 +467,15 @@ def sync_article(
     # ========================================================
     # IMPORTANT
     #
-    # IMAGE IS NOT INCLUDED.
+    # DO NOT SEND "slug" HERE.
     #
-    # We are intentionally sending only:
+    # Webflow gives:
     #
-    # Name
-    # Slug
-    # Link
-    # Source
-    # Publish Date
+    # Unique value is already in database
     #
+    # when the existing slug is sent again.
+    #
+    # Therefore existing item's slug is left untouched.
     # ========================================================
 
     field_data = {
@@ -361,112 +483,52 @@ def sync_article(
         "name":
             title,
 
-        "slug":
-            slug,
-
-        link_field:
+        "news-link":
             link,
 
-        source_field:
+        "source-name":
             source,
 
         "publish-date":
-            webflow_date
+            webflow_date,
     }
 
 
     # ========================================================
-    # FIND EXISTING ARTICLE USING ARTICLE URL
+    # IMAGE DISABLED FOR NOW
     # ========================================================
 
-    existing_item = find_existing_item(
-        existing_items,
-        link_field,
-        link
-    )
+    # field_data["news-image"] = {
+    #     "url": image_url,
+    #     "alt": title
+    # }
 
-
-    # ========================================================
-    # UPDATE EXISTING ITEM
-    # ========================================================
-
-    if existing_item:
-
-        item_id = existing_item.get(
-            "id"
-        )
-
-        print(
-            "Existing article found."
-        )
-
-        print(
-            f"Updating item ID: {item_id}"
-        )
-
-        update_url = (
-            f"https://api.webflow.com/v2/"
-            f"collections/{collection_id}/"
-            f"items/{item_id}"
-        )
-
-        payload = {
-            "fieldData": field_data
-        }
-
-        status, response = webflow_request(
-            "PATCH",
-            update_url,
-            payload
-        )
-
-        print(
-            f"Updated Webflow item: {status}"
-        )
-
-        return "updated"
-
-
-    # ========================================================
-    # CREATE NEW ITEM
-    # ========================================================
-
-    print(
-        "New article found."
-    )
-
-    print(
-        "Creating new Webflow item..."
-    )
-
-    create_url = (
-        f"https://api.webflow.com/v2/"
-        f"collections/{collection_id}/items"
-    )
 
     payload = {
-
-        "isArchived":
-            False,
-
-        "isDraft":
-            False,
-
         "fieldData":
             field_data
     }
 
+
+    url = (
+        collection_items_url(
+            collection_id
+        )
+        + f"/{item_id}"
+    )
+
+
     status, response = webflow_request(
-        "POST",
-        create_url,
+        "PATCH",
+        url,
         payload
     )
 
     print(
-        f"Created Webflow item: {status}"
+        f"Updated Webflow item: {status}"
     )
 
-    return "created"
+    return response
 
 
 # ============================================================
@@ -476,8 +538,6 @@ def sync_article(
 def sync_collection(
     collection_name,
     collection_id,
-    link_field,
-    source_field,
     articles
 ):
 
@@ -487,7 +547,7 @@ def sync_collection(
     )
 
     print(
-        f"SYNCING {collection_name}"
+        f"SYNCING {collection_name.upper()}"
     )
 
     print(
@@ -500,26 +560,18 @@ def sync_collection(
 
 
     # --------------------------------------------------------
-    # READ EXISTING ITEMS ONLY ONCE
+    # GET EXISTING ITEMS
     # --------------------------------------------------------
-
-    print("")
-    print(
-        "Reading existing Webflow items..."
-    )
 
     existing_items = get_existing_items(
         collection_id
     )
 
-    print(
-        f"Found {len(existing_items)} "
-        f"existing items."
-    )
-
 
     created = 0
+
     updated = 0
+
     failed = 0
 
 
@@ -529,28 +581,36 @@ def sync_collection(
 
     for article in articles:
 
+        title = article["title"]
+
+        link = article["link"]
+
+        pub_date = article["pub_date"]
+
+        source = get_source(
+            link
+        )
+
+
         print("")
         print(
             "--------------------------------------"
         )
 
         print(
-            f"Title: {article['title']}"
+            f"Title: {title}"
         )
 
         print(
-            f"Source: "
-            f"{get_source(article['link'])}"
+            f"Source: {source}"
         )
 
         print(
-            f"Date: "
-            f"{article['pub_date']}"
+            f"Date: {pub_date}"
         )
 
         print(
-            f"URL: "
-            f"{article['link']}"
+            f"URL: {link}"
         )
 
         print(
@@ -560,45 +620,69 @@ def sync_collection(
 
         try:
 
-            result = sync_article(
-                collection_id,
-                article,
-                link_field,
-                source_field,
-                existing_items
+            existing_item = (
+                find_existing_article(
+                    existing_items,
+                    link
+                )
             )
 
 
-            if result == "created":
+            # =================================================
+            # EXISTING ITEM
+            # =================================================
 
-                created += 1
+            if existing_item:
+
+                item_id = existing_item.get(
+                    "id"
+                )
+
+                print(
+                    "Existing article found."
+                )
+
+                print(
+                    f"Updating item ID: {item_id}"
+                )
 
 
-                # Add newly created article
-                # to our local list so that
-                # duplicates in the same RSS
-                # run are also avoided.
+                update_item(
+                    collection_id,
+                    item_id,
+                    article
+                )
 
-                existing_items.append({
-                    "id": None,
-                    "fieldData": {
-                        link_field:
-                            article["link"]
-                    }
-                })
-
-
-            elif result == "updated":
 
                 updated += 1
 
 
-        except Exception as error:
+            # =================================================
+            # NEW ITEM
+            # =================================================
+
+            else:
+
+                print(
+                    "New article found."
+                )
+
+                create_item(
+                    collection_id,
+                    article,
+                    include_slug=True
+                )
+
+
+                created += 1
+
+
+        except urllib.error.HTTPError:
 
             failed += 1
 
             print(
-                f"Could not sync item: {error}"
+                "Could not sync item."
             )
 
 
@@ -608,7 +692,7 @@ def sync_collection(
 
     print("")
     print(
-        f"{collection_name} results:"
+        f"{collection_name.upper()} results:"
     )
 
     print(
@@ -623,7 +707,6 @@ def sync_collection(
         f"Failed: {failed}"
     )
 
-
     return (
         created,
         updated,
@@ -632,7 +715,7 @@ def sync_collection(
 
 
 # ============================================================
-# PUBLISH WEBFLOW
+# PUBLISH WEBFLOW SITE
 # ============================================================
 
 def publish_site():
@@ -651,16 +734,8 @@ def publish_site():
     )
 
 
-    publish_url = (
-        f"https://api.webflow.com/v2/sites/"
-        f"{SITE_ID}/publish"
-    )
-
-
     payload = {
-
-        "publishToWebflowSubdomain":
-            True
+        "publishToWebflowSubdomain": True
     }
 
 
@@ -668,13 +743,12 @@ def publish_site():
 
         status, response = webflow_request(
             "POST",
-            publish_url,
+            WEBFLOW_PUBLISH_URL,
             payload
         )
 
         print(
-            f"Webflow publish response: "
-            f"{status}"
+            f"Webflow publish response: {status}"
         )
 
         print(
@@ -715,7 +789,7 @@ def main():
 
     print(
         f"Trending News Collection: "
-        f"{TRENDING_COLLECTION_ID}"
+        f"{TRENDING_NEWS_COLLECTION_ID}"
     )
 
     print(
@@ -729,12 +803,12 @@ def main():
 
     rss_data = fetch_rss()
 
+
     articles = parse_rss(
         rss_data
     )
 
 
-    print("")
     print(
         f"Found {len(articles)} RSS articles"
     )
@@ -750,93 +824,45 @@ def main():
 
 
     # ========================================================
-    # LATEST 10
+    # LATEST 10 ARTICLES
     # ========================================================
 
     articles = articles[:10]
 
 
     print(
-        f"Processing latest "
-        f"{len(articles)} articles..."
+        "Processing latest 10 articles..."
     )
 
 
     # ========================================================
-    # TICKER
-    #
-    # Fields:
-    #
-    # name
-    # slug
-    # news-url
-    # source
-    # publish-date
-    #
+    # SYNC TICKER
     # ========================================================
 
-    ticker_created, ticker_updated, ticker_failed = (
-        sync_collection(
-            "TICKER",
-            TICKER_COLLECTION_ID,
-            "news-url",
-            "source",
-            articles
-        )
+    sync_collection(
+        "Ticker",
+        TICKER_COLLECTION_ID,
+        articles
     )
 
 
     # ========================================================
-    # TRENDING NEWS
-    #
-    # Fields:
-    #
-    # name
-    # slug
-    # news-link
-    # source-name
-    # publish-date
-    #
+    # SYNC TRENDING NEWS
     # ========================================================
 
-    trending_created, trending_updated, trending_failed = (
-        sync_collection(
-            "TRENDING NEWS",
-            TRENDING_COLLECTION_ID,
-            "news-link",
-            "source-name",
-            articles
-        )
+    sync_collection(
+        "Trending News",
+        TRENDING_NEWS_COLLECTION_ID,
+        articles
     )
 
 
     # ========================================================
-    # PUBLISH IF SOMETHING CHANGED
+    # PUBLISH
     # ========================================================
 
-    total_changes = (
-        ticker_created
-        + ticker_updated
-        + trending_created
-        + trending_updated
-    )
+    publish_site()
 
-
-    if total_changes > 0:
-
-        publish_site()
-
-    else:
-
-        print("")
-        print(
-            "No CMS changes detected."
-        )
-
-
-    # ========================================================
-    # FINISHED
-    # ========================================================
 
     print("")
     print(
@@ -851,6 +877,10 @@ def main():
         "======================================"
     )
 
+
+# ============================================================
+# RUN
+# ============================================================
 
 if __name__ == "__main__":
 
