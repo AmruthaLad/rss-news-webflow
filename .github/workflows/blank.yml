@@ -23,4 +23,5 @@ jobs:
           WEBFLOW_API_TOKEN: ${{ secrets.WEBFLOW_API_TOKEN }}
           RSS_FEED_URL: ${{ secrets.RSS_FEED_URL }}
           WEBFLOW_COLLECTION_ID: ${{ secrets.WEBFLOW_COLLECTION_ID }}
+          WEBFLOW_SITE_ID: ${{ secrets.WEBFLOW_SITE_ID }}
         run: python sync_news.py
