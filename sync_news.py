@@ -5,6 +5,7 @@ import json
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 
 
 RSS_URL = os.environ["RSS_FEED_URL"]
@@ -64,6 +65,41 @@ def parse_rss(data):
         )
 
     return articles
+
+
+def convert_date(date_string):
+    """
+    Convert RSS date such as:
+
+    Thu, 20 Aug 2026 11:00:00 GMT
+
+    into Webflow-compatible ISO format:
+
+    2026-08-20T11:00:00.000Z
+    """
+
+    if not date_string:
+        return ""
+
+    try:
+        date = parsedate_to_datetime(date_string)
+
+        # Convert to UTC
+        if date.tzinfo is not None:
+            from datetime import timezone
+            date = date.astimezone(timezone.utc)
+
+        return date.strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z"
+        )
+
+    except Exception as error:
+
+        print(
+            f"Date conversion failed: {error}"
+        )
+
+        return ""
 
 
 def get_source(link):
@@ -144,8 +180,7 @@ def webflow_request(method, url, data=None):
         )
 
         print(
-            f"Webflow API error: "
-            f"{error.code}"
+            f"Webflow API error: {error.code}"
         )
 
         print(error_body)
@@ -162,7 +197,7 @@ def main():
     )
 
     # --------------------------------
-    # Read RSS
+    # Read RSS feed
     # --------------------------------
 
     rss_data = fetch_rss()
@@ -176,6 +211,7 @@ def main():
     if not articles:
 
         print("No RSS articles found.")
+
         return
 
     # --------------------------------
@@ -194,12 +230,17 @@ def main():
 
         slug = create_slug(title)
 
+        webflow_date = convert_date(
+            pub_date
+        )
+
         print("")
         print("----------------------------")
         print(f"Title: {title}")
         print(f"Source: {source}")
         print(f"URL: {link}")
-        print(f"Date: {pub_date}")
+        print(f"RSS Date: {pub_date}")
+        print(f"Webflow Date: {webflow_date}")
         print("----------------------------")
 
         # --------------------------------
@@ -209,12 +250,9 @@ def main():
         field_data = {
             "name": title,
             "slug": slug,
-
-            # These are the likely Webflow
-            # custom field slugs.
             "news-url": link,
             "source": source,
-            "publish-date": pub_date,
+            "publish-date": webflow_date,
         }
 
         payload = {
@@ -232,8 +270,7 @@ def main():
             )
 
             print(
-                f"Created Webflow item: "
-                f"{status}"
+                f"Created Webflow item: {status}"
             )
 
         except urllib.error.HTTPError:
@@ -242,7 +279,6 @@ def main():
                 "Could not create this item."
             )
 
-            # Continue with the next article
             continue
 
     print("")
