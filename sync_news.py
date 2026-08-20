@@ -5,37 +5,28 @@ import urllib.error
 
 
 WEBFLOW_TOKEN = os.environ["WEBFLOW_API_TOKEN"]
-COLLECTION_ID = os.environ["WEBFLOW_COLLECTION_ID"]
+
+# Trending News collection
+COLLECTION_ID = "69b29bb5bd5023577d30cdf1"
 
 
-WEBFLOW_COLLECTION_URL = (
-    f"https://api.webflow.com/v2/collections/"
-    f"{COLLECTION_ID}"
-)
+def get_collection_schema():
 
-
-def webflow_request(
-    method,
-    url,
-    data=None
-):
+    url = (
+        f"https://api.webflow.com/v2/collections/"
+        f"{COLLECTION_ID}"
+    )
 
     headers = {
         "Authorization": f"Bearer {WEBFLOW_TOKEN}",
         "Content-Type": "application/json",
-        "Accept-Version": "1.0.0",
     }
 
     request = urllib.request.Request(
         url,
-        method=method,
-        headers=headers
+        headers=headers,
+        method="GET"
     )
-
-    if data is not None:
-        request.data = json.dumps(
-            data
-        ).encode("utf-8")
 
     try:
 
@@ -44,28 +35,29 @@ def webflow_request(
             timeout=30
         ) as response:
 
-            return (
-                response.status,
+            data = json.loads(
                 response.read().decode("utf-8")
             )
 
+            return data
+
     except urllib.error.HTTPError as error:
 
-        error_body = error.read().decode(
-            "utf-8",
-            errors="replace"
+        print(
+            f"Webflow API Error: {error.code}"
         )
 
         print(
-            f"Webflow API error: {error.code}"
+            error.read().decode(
+                "utf-8",
+                errors="replace"
+            )
         )
 
-        print(error_body)
-
-        raise
+        return None
 
 
-def check_collection_schema():
+def main():
 
     print("")
     print(
@@ -73,7 +65,7 @@ def check_collection_schema():
     )
 
     print(
-        "CHECKING WEBFLOW COLLECTION SCHEMA"
+        "CHECKING TRENDING NEWS COLLECTION"
     )
 
     print(
@@ -86,49 +78,41 @@ def check_collection_schema():
 
     print("")
 
-    status, response = webflow_request(
-        "GET",
-        WEBFLOW_COLLECTION_URL
+    data = get_collection_schema()
+
+    if not data:
+        return
+
+    print(
+        "FULL COLLECTION INFORMATION:"
     )
 
-    data = json.loads(response)
+    print(
+        json.dumps(
+            data,
+            indent=2
+        )
+    )
+
+    print("")
+    print(
+        "======================================"
+    )
+
+    print(
+        "FIELDS"
+    )
+
+    print(
+        "======================================"
+    )
 
     fields = data.get(
         "fields",
         []
     )
 
-    if not fields:
-
-        print(
-            "No fields were returned."
-        )
-
-        print("")
-        print(
-            "Full Webflow response:"
-        )
-
-        print(
-            json.dumps(
-                data,
-                indent=2
-            )
-        )
-
-        return
-
-    print(
-        f"Found {len(fields)} collection fields."
-    )
-
-    print("")
-
     for field in fields:
-
-        print(
-            "--------------------------------------"
-        )
 
         print(
             f"Name: "
@@ -145,28 +129,9 @@ def check_collection_schema():
             f"{field.get('type')}"
         )
 
-    print(
-        "--------------------------------------"
-    )
-
-    print("")
-    print(
-        "Schema check completed."
-    )
-
-
-def main():
-
-    print(
-        "Starting Webflow collection check"
-    )
-
-    check_collection_schema()
-
-    print("")
-    print(
-        "DONE"
-    )
+        print(
+            "--------------------------------------"
+        )
 
 
 if __name__ == "__main__":
