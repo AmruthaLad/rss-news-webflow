@@ -1,16 +1,16 @@
 name: RSS News Sync
 
 on:
-  workflow_dispatch:
-
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
 
 jobs:
   sync-news:
     runs-on: ubuntu-latest
 
     steps:
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
