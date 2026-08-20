@@ -1,7 +1,9 @@
+import os
+import re
 import requests
 import feedparser
-import re
-from datetime import datetime
+from datetime import datetime, timezone
+from collections import defaultdict
 from email.utils import parsedate_to_datetime
 
 
@@ -9,22 +11,21 @@ from email.utils import parsedate_to_datetime
 # CONFIGURATION
 # ============================================================
 
-WEBFLOW_API_TOKEN = "YOUR_WEBFLOW_API_TOKEN"
+WEBFLOW_API_TOKEN = os.environ["WEBFLOW_API_TOKEN"]
+RSS_FEED_URL = os.environ["RSS_FEED_URL"]
 
-SITE_ID = "YOUR_SITE_ID"
-
-RSS_URL = "YOUR_RSS_FEED_URL"
-
-# Your existing Ticker collection ID
-TICKER_COLLECTION_ID = "YOUR_TICKER_COLLECTION_ID"
+# Ticker collection
+TICKER_COLLECTION_ID = os.environ["WEBFLOW_COLLECTION_ID"]
 
 # Trending News collection
-TRENDING_NEWS_COLLECTION_ID = "69b29bb5bd5023577d30cdf1"
+TRENDING_COLLECTION_ID = "69b29bb5bd5023577d30cdf1"
 
+WEBFLOW_SITE_ID = os.environ["WEBFLOW_SITE_ID"]
 
-# ============================================================
-# WEBFLOW API
-# ============================================================
+MAX_TOTAL_ARTICLES = 10
+MAX_PER_SOURCE = 2
+
+WEBFLOW_API_BASE = "https://api.webflow.com/v2"
 
 HEADERS = {
     "Authorization": f"Bearer {WEBFLOW_API_TOKEN}",
@@ -33,11 +34,21 @@ HEADERS = {
 
 
 # ============================================================
-# SLUG GENERATOR
+# HELPER FUNCTIONS
 # ============================================================
 
+def clean_text(value):
+    if value is None:
+        return ""
+
+    return str(value).strip()
+
+
 def make_slug(title):
-    slug = title.lower()
+    """
+    Create Webflow-safe slug.
+    """
+    slug = clean_text(title).lower()
 
     slug = re.sub(r"[^a-z0-9\s-]", "", slug)
     slug = re.sub(r"\s+", "-", slug)
@@ -45,26 +56,30 @@ def make_slug(title):
 
     slug = slug.strip("-")
 
-    # Webflow slug field max length = 256
     return slug[:250]
 
 
-# ============================================================
-# DATE CONVERTER
-# ============================================================
+def parse_date(date_string):
+    """
+    Convert RSS date into ISO 8601 format accepted by Webflow.
+    """
 
-def convert_date(date_string):
+    if not date_string:
+        return None
 
     try:
         dt = parsedate_to_datetime(date_string)
 
-        # Convert to UTC
-        dt = dt.astimezone()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
 
-        return dt.isoformat()
+        dt = dt.astimezone(timezone.utc)
+
+        return dt.isoformat().replace("+00:00", "Z")
 
     except Exception:
-        return datetime.utcnow().isoformat() + "Z"
+        print(f"Could not parse date: {date_string}")
+        return None
 
 
 # ============================================================
@@ -75,81 +90,64 @@ def read_rss():
 
     print("Reading RSS feed...")
 
-    feed = feedparser.parse(RSS_URL)
+    feed = feedparser.parse(RSS_FEED_URL)
 
     articles = []
 
     for entry in feed.entries:
 
-        title = entry.get("title", "").strip()
+        title = clean_text(entry.get("title"))
 
-        url = entry.get("link", "").strip()
+        url = clean_text(
+            entry.get("link")
+            or entry.get("url")
+        )
 
-        source = ""
+        source = clean_text(
+            entry.get("source", {}).get("title")
+            if isinstance(entry.get("source"), dict)
+            else entry.get("author")
+        )
 
-        # Try RSS source
-        if hasattr(entry, "source"):
-            source = entry.source.get("title", "")
-
-        # Fallback
-        if not source:
-            source = entry.get("author", "")
-
-        # Final fallback
+        # Fallback source
         if not source:
             source = "Unknown"
 
-        source = source.strip()
-
-        date_string = (
+        rss_date = clean_text(
             entry.get("published")
             or entry.get("updated")
-            or ""
         )
 
         image_url = ""
 
         # ----------------------------------------------------
-        # Try media content
+        # IMAGE EXTRACTION
+        # Currently not being sent to Webflow.
         # ----------------------------------------------------
 
-        if hasattr(entry, "media_content"):
-
+        if entry.get("media_content"):
             try:
-
-                if entry.media_content:
-                    image_url = entry.media_content[0].get("url", "")
-
+                image_url = entry.media_content[0].get("url", "")
             except Exception:
                 pass
 
-        # ----------------------------------------------------
-        # Try media thumbnail
-        # ----------------------------------------------------
-
-        if not image_url and hasattr(entry, "media_thumbnail"):
-
+        if not image_url and entry.get("media_thumbnail"):
             try:
-
-                if entry.media_thumbnail:
-                    image_url = entry.media_thumbnail[0].get("url", "")
-
+                image_url = entry.media_thumbnail[0].get("url", "")
             except Exception:
                 pass
 
-        # ----------------------------------------------------
-        # Add article
-        # ----------------------------------------------------
+        if not title or not url:
+            continue
 
-        if title and url:
-
-            articles.append({
-                "title": title,
-                "url": url,
-                "source": source,
-                "date": date_string,
-                "image": image_url
-            })
+        articles.append({
+            "title": title,
+            "url": url,
+            "source": source,
+            "date": rss_date,
+            "publish_date": parse_date(rss_date),
+            "image": image_url
+        })
 
     print(f"Found {len(articles)} RSS articles")
 
@@ -157,27 +155,89 @@ def read_rss():
 
 
 # ============================================================
-# GET EXISTING WEBFLOW ITEMS
+# FILTER ARTICLES
+# MAXIMUM 2 FROM EACH SOURCE
+# MAXIMUM 10 TOTAL
 # ============================================================
 
-def get_existing_items(collection_id):
+def select_articles(articles):
+
+    print()
+    print("======================================")
+    print("FILTERING RSS ARTICLES")
+    print("======================================")
+
+    # Sort newest first
+    def sort_key(article):
+        try:
+            if article["publish_date"]:
+                return datetime.fromisoformat(
+                    article["publish_date"].replace("Z", "+00:00")
+                )
+        except Exception:
+            pass
+
+        return datetime.min.replace(tzinfo=timezone.utc)
+
+    articles.sort(
+        key=sort_key,
+        reverse=True
+    )
+
+    selected_articles = []
+
+    source_counts = defaultdict(int)
+
+    for article in articles:
+
+        source_key = article["source"].strip().lower()
+
+        # Maximum 2 articles from the same source
+        if source_counts[source_key] >= MAX_PER_SOURCE:
+            continue
+
+        selected_articles.append(article)
+
+        source_counts[source_key] += 1
+
+        # Stop when we have 10 articles
+        if len(selected_articles) >= MAX_TOTAL_ARTICLES:
+            break
+
+    print(
+        f"Selected {len(selected_articles)} articles "
+        f"(maximum {MAX_PER_SOURCE} per source)"
+    )
+
+    print()
+
+    for source, count in source_counts.items():
+        print(f"{source}: {count}")
+
+    print()
+
+    return selected_articles
+
+
+# ============================================================
+# GET COLLECTION ITEMS
+# ============================================================
+
+def get_collection_items(collection_id):
 
     print("Reading existing Webflow items...")
 
-    url = (
-        f"https://api.webflow.com/v2/collections/"
-        f"{collection_id}/items?limit=100"
-    )
+    url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
 
-    items = []
+    all_items = []
 
     offset = 0
 
     while True:
 
         params = {
-            "limit": 100,
-            "offset": offset
+            "offset": offset,
+            "limit": 100
         }
 
         response = requests.get(
@@ -188,132 +248,158 @@ def get_existing_items(collection_id):
 
         if response.status_code != 200:
 
-            print("Could not read Webflow items")
+            print(
+                f"Webflow API error while reading collection: "
+                f"{response.status_code}"
+            )
 
-            print(response.status_code)
             print(response.text)
 
-            break
+            return all_items
 
         data = response.json()
 
-        batch = data.get("items", [])
+        items = data.get("items", [])
 
-        items.extend(batch)
+        all_items.extend(items)
 
-        if len(batch) < 100:
+        if len(items) < 100:
             break
 
         offset += 100
 
-    print(f"Found {len(items)} existing items.")
+    print(f"Found {len(all_items)} existing items.")
 
-    return items
+    return all_items
 
 
 # ============================================================
-# CREATE EXISTING ITEM LOOKUP
+# FIND EXISTING ITEM
 # ============================================================
 
-def build_existing_lookup(items):
-
-    lookup = {}
+def find_existing_item(items, article_url):
 
     for item in items:
 
         field_data = item.get("fieldData", {})
 
-        news_link = field_data.get("news-link")
+        # -----------------------------------------------
+        # Ticker uses news-url
+        # Trending uses news-link
+        # -----------------------------------------------
 
-        # Ticker collection may use news-url
-        if not news_link:
-            news_link = field_data.get("news-url")
+        existing_url = (
+            field_data.get("news-url")
+            or field_data.get("news-link")
+        )
 
-        if news_link:
+        if existing_url == article_url:
+            return item
 
-            lookup[news_link] = item
+    return None
 
-    return lookup
+
+# ============================================================
+# CREATE FIELD DATA
+# ============================================================
+
+def build_field_data(article, collection_type):
+
+    title = article["title"]
+    url = article["url"]
+    source = article["source"]
+    publish_date = article["publish_date"]
+
+    slug = make_slug(title)
+
+    # ----------------------------------------------------
+    # TICKER COLLECTION
+    #
+    # Fields:
+    # Name
+    # News URL
+    # Source
+    # Publish Date
+    # Slug
+    # ----------------------------------------------------
+
+    if collection_type == "ticker":
+
+        field_data = {
+            "name": title,
+            "news-url": url,
+            "source": source,
+            "slug": slug
+        }
+
+        if publish_date:
+            field_data["publish-date"] = publish_date
+
+        return field_data
+
+    # ----------------------------------------------------
+    # TRENDING NEWS COLLECTION
+    #
+    # Fields:
+    # Name
+    # News Link
+    # Source Name
+    # Publish Date
+    # Slug
+    #
+    # IMAGE INTENTIONALLY COMMENTED OUT
+    # ----------------------------------------------------
+
+    if collection_type == "trending":
+
+        field_data = {
+            "name": title,
+            "news-link": url,
+            "source-name": source,
+            "slug": slug
+        }
+
+        if publish_date:
+            field_data["publish-date"] = publish_date
+
+        # ------------------------------------------------
+        # NEWS IMAGE TEMPORARILY DISABLED
+        #
+        # field_data["news-image"] = {
+        #     "url": article["image"],
+        #     "alt": title
+        # }
+        # ------------------------------------------------
+
+        return field_data
+
+    return {}
 
 
 # ============================================================
 # CREATE WEBFLOW ITEM
 # ============================================================
 
-def create_item(
-    collection_id,
-    article,
-    collection_type
-):
+def create_item(collection_id, article, collection_type):
 
-    title = article["title"]
+    url = f"{WEBFLOW_API_BASE}/collections/{collection_id}/items"
 
-    url = article["url"]
-
-    source = article["source"]
-
-    date_string = article["date"]
-
-    slug = make_slug(title)
-
-    publish_date = convert_date(date_string)
-
-    # --------------------------------------------------------
-    # TICKER
-    # --------------------------------------------------------
-
-    if collection_type == "ticker":
-
-        field_data = {
-
-            "name": title,
-
-            "news-url": url,
-
-            "source": source,
-
-            "publish-date": publish_date,
-
-            "slug": slug
-
-        }
-
-    # --------------------------------------------------------
-    # TRENDING NEWS
-    # --------------------------------------------------------
-
-    else:
-
-        field_data = {
-
-            "name": title,
-
-            "news-link": url,
-
-            "source-name": source,
-
-            "publish-date": publish_date,
-
-            "slug": slug
-
-        }
+    field_data = build_field_data(
+        article,
+        collection_type
+    )
 
     payload = {
         "fieldData": field_data
     }
 
-    api_url = (
-        f"https://api.webflow.com/v2/collections/"
-        f"{collection_id}/items"
-    )
-
     response = requests.post(
-        api_url,
+        url,
         headers=HEADERS,
         json=payload
     )
 
-    if response.status_code in [200, 201, 202]:
+    if response.status_code in (200, 201):
 
         print(
             f"Created Webflow item: "
@@ -322,7 +408,10 @@ def create_item(
 
         return True
 
-    print("Webflow API error:", response.status_code)
+    print(
+        f"Webflow API error: {response.status_code}"
+    )
+
     print(response.text)
 
     return False
@@ -337,75 +426,52 @@ def update_item(
     item_id,
     article,
     collection_type,
-    existing_slug=None
+    existing_item=None
 ):
 
-    title = article["title"]
+    url = (
+        f"{WEBFLOW_API_BASE}/collections/"
+        f"{collection_id}/items/{item_id}"
+    )
 
-    url = article["url"]
+    field_data = build_field_data(
+        article,
+        collection_type
+    )
 
-    source = article["source"]
-
-    date_string = article["date"]
-
-    publish_date = convert_date(date_string)
-
-    # --------------------------------------------------------
+    # ----------------------------------------------------
     # IMPORTANT:
     #
-    # Do NOT change the existing slug during update.
+    # Webflow can reject slug updates if another item
+    # already owns the slug.
     #
-    # This prevents:
-    #
-    # "Unique value is already in database"
-    #
-    # errors when duplicate/old items exist.
-    # --------------------------------------------------------
+    # For an existing article, we therefore keep the
+    # existing item's slug.
+    # ----------------------------------------------------
 
-    if collection_type == "ticker":
+    if existing_item:
 
-        field_data = {
+        existing_field_data = existing_item.get(
+            "fieldData",
+            {}
+        )
 
-            "name": title,
+        existing_slug = existing_field_data.get("slug")
 
-            "news-url": url,
-
-            "source": source,
-
-            "publish-date": publish_date
-
-        }
-
-    else:
-
-        field_data = {
-
-            "name": title,
-
-            "news-link": url,
-
-            "source-name": source,
-
-            "publish-date": publish_date
-
-        }
+        if existing_slug:
+            field_data["slug"] = existing_slug
 
     payload = {
         "fieldData": field_data
     }
 
-    api_url = (
-        f"https://api.webflow.com/v2/collections/"
-        f"{collection_id}/items/{item_id}"
-    )
-
     response = requests.patch(
-        api_url,
+        url,
         headers=HEADERS,
         json=payload
     )
 
-    if response.status_code in [200, 201, 202]:
+    if response.status_code in (200, 201):
 
         print(
             f"Updated Webflow item: "
@@ -414,7 +480,10 @@ def update_item(
 
         return True
 
-    print("Webflow API error:", response.status_code)
+    print(
+        f"Webflow API error: {response.status_code}"
+    )
+
     print(response.text)
 
     return False
@@ -427,171 +496,129 @@ def update_item(
 def sync_collection(
     collection_id,
     articles,
-    collection_type
+    collection_type,
+    collection_name
 ):
 
-    print("--------------------------------------")
-    print("Collection ID:", collection_id)
+    print()
+    print("======================================")
+    print(f"SYNCING {collection_name.upper()}")
+    print("======================================")
 
-    existing_items = get_existing_items(collection_id)
+    print(f"Collection ID: {collection_id}")
 
-    existing_lookup = build_existing_lookup(existing_items)
+    existing_items = get_collection_items(
+        collection_id
+    )
 
     created = 0
-
     updated = 0
-
     failed = 0
 
     for article in articles:
 
+        print()
         print("--------------------------------------")
-
-        print("Title:", article["title"])
-
-        print("Source:", article["source"])
-
-        print("Date:", article["date"])
-
-        print("URL:", article["url"])
-
-        print("--------------------------------------")
-
-        url = article["url"]
-
-        existing_item = existing_lookup.get(url)
-
-        try:
-
-            if existing_item:
-
-                print("Existing article found.")
-
-                item_id = existing_item.get("id")
-
-                print(
-                    "Updating item ID:",
-                    item_id
-                )
-
-                success = update_item(
-                    collection_id,
-                    item_id,
-                    article,
-                    collection_type
-                )
-
-                if success:
-                    updated += 1
-                else:
-                    failed += 1
-
-            else:
-
-                print("New article found.")
-
-                success = create_item(
-                    collection_id,
-                    article,
-                    collection_type
-                )
-
-                if success:
-                    created += 1
-                else:
-                    failed += 1
-
-        except Exception as e:
-
-            print("Could not sync item:", e)
-
-            failed += 1
-
-    return created, updated, failed
-
-
-# ============================================================
-# SELECT TRENDING NEWS
-# MAXIMUM 2 FROM EACH SOURCE
-# ============================================================
-
-def select_trending_articles(articles):
-
-    print("")
-    print("======================================")
-    print("SELECTING TRENDING NEWS")
-    print("======================================")
-
-    trending_articles = []
-
-    source_count = {}
-
-    for article in articles:
-
-        source = article["source"].strip()
-
-        if not source:
-            source = "Unknown"
-
-        current_count = source_count.get(
-            source,
-            0
-        )
-
-        # -----------------------------------------------
-        # MAXIMUM 2 ARTICLES FROM SAME SOURCE
-        # -----------------------------------------------
-
-        if current_count >= 2:
-
-            continue
-
-        trending_articles.append(article)
-
-        source_count[source] = current_count + 1
-
-        # -----------------------------------------------
-        # STOP AT 10 ARTICLES
-        # -----------------------------------------------
-
-        if len(trending_articles) >= 10:
-
-            break
-
-    print("")
-
-    print(
-        f"Selected {len(trending_articles)} "
-        f"Trending News articles"
-    )
-
-    print("")
-
-    print("Source distribution:")
-
-    for source, count in source_count.items():
 
         print(
-            f"  {source}: {count}"
+            f"Title: {article['title']}"
         )
 
-    return trending_articles
+        print(
+            f"Source: {article['source']}"
+        )
+
+        print(
+            f"Date: {article['date']}"
+        )
+
+        print(
+            f"URL: {article['url']}"
+        )
+
+        print("--------------------------------------")
+
+        existing_item = find_existing_item(
+            existing_items,
+            article["url"]
+        )
+
+        # ==================================================
+        # UPDATE EXISTING
+        # ==================================================
+
+        if existing_item:
+
+            item_id = existing_item.get("id")
+
+            print("Existing article found.")
+
+            print(
+                f"Updating item ID: {item_id}"
+            )
+
+            success = update_item(
+                collection_id,
+                item_id,
+                article,
+                collection_type,
+                existing_item
+            )
+
+            if success:
+                updated += 1
+            else:
+                failed += 1
+
+        # ==================================================
+        # CREATE NEW
+        # ==================================================
+
+        else:
+
+            print("New article found.")
+
+            success = create_item(
+                collection_id,
+                article,
+                collection_type
+            )
+
+            if success:
+                created += 1
+            else:
+                failed += 1
+
+    print()
+    print(
+        f"{collection_name.upper()} results:"
+    )
+
+    print(f"Created: {created}")
+    print(f"Updated: {updated}")
+    print(f"Failed: {failed}")
+
+    return {
+        "created": created,
+        "updated": updated,
+        "failed": failed
+    }
 
 
 # ============================================================
 # PUBLISH WEBFLOW SITE
 # ============================================================
 
-def publish_site():
+def publish_webflow_site():
 
-    print("")
+    print()
     print("======================================")
     print("PUBLISHING WEBFLOW SITE")
     print("======================================")
 
     url = (
-        f"https://api.webflow.com/v2/sites/"
-        f"{SITE_ID}/publish"
+        f"{WEBFLOW_API_BASE}/sites/"
+        f"{WEBFLOW_SITE_ID}/publish"
     )
 
     payload = {
@@ -605,25 +632,21 @@ def publish_site():
     )
 
     print(
-        "Webflow publish response:",
-        response.status_code
+        f"Webflow publish response: "
+        f"{response.status_code}"
     )
 
-    if response.text:
+    if response.status_code not in (200, 201, 202):
 
         print(response.text)
 
-    if response.status_code in [200, 201, 202]:
+        return False
 
-        print(
-            "Webflow site publish request completed."
-        )
+    print(
+        "Webflow site publish request completed."
+    )
 
-    else:
-
-        print(
-            "Webflow site publish failed."
-        )
+    return True
 
 
 # ============================================================
@@ -632,27 +655,27 @@ def publish_site():
 
 def main():
 
-    print("")
+    print()
     print("======================================")
     print("STARTING RSS → WEBFLOW SYNC")
     print("======================================")
 
     print(
-        "Ticker Collection:",
-        TICKER_COLLECTION_ID
+        f"Ticker Collection: "
+        f"{TICKER_COLLECTION_ID}"
     )
 
     print(
-        "Trending News Collection:",
-        TRENDING_NEWS_COLLECTION_ID
+        f"Trending News Collection: "
+        f"{TRENDING_COLLECTION_ID}"
     )
 
     print(
-        "Site ID:",
-        SITE_ID
+        f"Site ID: "
+        f"{WEBFLOW_SITE_ID}"
     )
 
-    print("")
+    print()
 
     # --------------------------------------------------------
     # READ RSS
@@ -667,121 +690,59 @@ def main():
         return
 
     # --------------------------------------------------------
-    # SORT BY DATE
+    # FILTER
+    # MAX 2 PER SOURCE
+    # MAX 10 TOTAL
     # --------------------------------------------------------
 
-    def sort_date(article):
-
-        try:
-
-            return parsedate_to_datetime(
-                article["date"]
-            )
-
-        except Exception:
-
-            return datetime.min
-
-    articles.sort(
-        key=sort_date,
-        reverse=True
-    )
-
-    # --------------------------------------------------------
-    # LATEST 10 FOR TICKER
-    # --------------------------------------------------------
-
-    ticker_articles = articles[:10]
-
-    # --------------------------------------------------------
-    # TRENDING:
-    # MAX 2 FROM EACH SOURCE
-    # --------------------------------------------------------
-
-    trending_articles = select_trending_articles(
+    articles = select_articles(
         articles
     )
 
-    print("")
+    if not articles:
+
+        print("No articles selected.")
+
+        return
+
     print(
         f"Processing latest "
-        f"{len(ticker_articles)} articles..."
+        f"{len(articles)} articles..."
     )
 
-    # ========================================================
-    # TICKER
-    # ========================================================
+    # --------------------------------------------------------
+    # SYNC TICKER
+    # --------------------------------------------------------
 
-    print("")
-    print("======================================")
-    print("SYNCING TICKER")
-    print("======================================")
-
-    ticker_created, ticker_updated, ticker_failed = (
-        sync_collection(
-            TICKER_COLLECTION_ID,
-            ticker_articles,
-            "ticker"
-        )
+    ticker_results = sync_collection(
+        TICKER_COLLECTION_ID,
+        articles,
+        "ticker",
+        "Ticker"
     )
 
-    print("")
+    # --------------------------------------------------------
+    # SYNC TRENDING NEWS
+    # --------------------------------------------------------
 
-    print("TICKER results:")
-
-    print("Created:", ticker_created)
-
-    print("Updated:", ticker_updated)
-
-    print("Failed:", ticker_failed)
-
-    # ========================================================
-    # TRENDING NEWS
-    # ========================================================
-
-    print("")
-    print("======================================")
-    print("SYNCING TRENDING NEWS")
-    print("======================================")
-
-    trending_created, trending_updated, trending_failed = (
-        sync_collection(
-            TRENDING_NEWS_COLLECTION_ID,
-            trending_articles,
-            "trending"
-        )
+    trending_results = sync_collection(
+        TRENDING_COLLECTION_ID,
+        articles,
+        "trending",
+        "Trending News"
     )
 
-    print("")
-
-    print("TRENDING NEWS results:")
-
-    print("Created:", trending_created)
-
-    print("Updated:", trending_updated)
-
-    print("Failed:", trending_failed)
-
-    # ========================================================
+    # --------------------------------------------------------
     # PUBLISH
-    # ========================================================
+    # --------------------------------------------------------
 
-    publish_site()
+    publish_webflow_site()
 
-    # ========================================================
-    # FINISHED
-    # ========================================================
-
-    print("")
+    print()
     print("======================================")
     print("RSS → WEBFLOW SYNC FINISHED")
     print("======================================")
 
 
-# ============================================================
-# RUN
-# ============================================================
-
 if __name__ == "__main__":
-
     main()
